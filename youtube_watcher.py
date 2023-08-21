@@ -1,10 +1,14 @@
 import logging
 from pprint import pformat
+from config import config
 import sys
 import requests
 import os
 import json
-from dotenv import load_dotenv
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.serialization import StringSerializer
+from confluent_kafka.schema_registry.avro import AvroSerializer
+from confluent_kafka import SerializingProducer
 
 #fetch the playlist items
 def load_playlist_items_page(google_api, youtube_playlist_id, page_token=None):
@@ -30,7 +34,7 @@ def load_videos_page(google_api, videoId, page_token=None):
 
 #fetch items from all playlists pages
 def fetch_playlist_items(google_api, youtube_playlist_id, page_token=None):
-    payload = load_playlist_items_page(google_api, youtube_playlist_id, page_token=None) 
+    payload = load_playlist_items_page(google_api, youtube_playlist_id, page_token) 
 
     yield from payload["items"]
     next_page_token = payload.get("nextPageToken")
@@ -55,17 +59,42 @@ def summarize_video(video):
         "comments": int(video["statistics"].get("commentCount", 0)),
     }
 
+def on_delivery(err, record):
+    pass
+
 def main():
     logging.info("Starting youtube watcher")
-    load_dotenv()
-    google_api = os.getenv("GOOGLE_API")
-    playlist_id = os.getenv("PLAYLIST_ID")
+    schema_registry_client= SchemaRegistryClient(config["schema_registry"])
+    google_api = config["google_api_key"]
+    playlist_id = config["youtube_playlist_id"]
+    youtube_videos_value_schema = schema_registry_client.get_latest_version("youtube_videos-value")
+    kafka_config = config["kafka"] | {
+        "key.serializer": StringSerializer(),
+        "value.serializer": AvroSerializer(
+            schema_registry_client,
+            youtube_videos_value_schema.schema.schema_str,
+        ),
+    }
+    producer = SerializingProducer(kafka_config)
 
     payload = fetch_playlist_items(google_api, playlist_id)
     for videoItem in payload:
         video_id = videoItem["contentDetails"]["videoId"]
         for video in fetch_videos(google_api, video_id):
             logging.info(pformat(summarize_video(video)))
+            
+            producer.produce(
+                topic = 'youtube_videos',
+                key =   video_id,
+                value = {
+                    "TITLE": video["snippet"]["title"],
+                    "VIEWS": int(video["statistics"].get("viewCount", 0)),
+                    "LIKES": int(video["statistics"].get("likeCount", 0)),
+                    "COMMENTS": int(video["statistics"].get("commentCount", 0)),
+                },
+                on_delivery = on_delivery,
+            )
+    producer.flush()
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
